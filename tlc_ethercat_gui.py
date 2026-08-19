@@ -14,8 +14,14 @@ TL-E 시리즈 EtherCAT 통합형 스텝모터(TLC86E 등) 테스트용 간단 G
 실행:  sudo python3 tlc_ethercat_gui.py     (raw 소켓 접근에 관리자 권한 필요)
 """
 
+import csv
+import datetime
+import json
+import math
+import os
 import queue
 import struct
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -80,6 +86,63 @@ ERROR_TEXT = {
     0xFF04: "상 오류(Phase error)",
     0xFF05: "위치편차(Position deviation)",
 }
+
+# ---- 신품 입고검사 (새 모터 테스트) ----------------------------------------
+# 식별 오브젝트 (CiA301 Identity Object). 서브: 1=VendorID 2=ProductCode
+# 3=RevisionNo 4=SerialNumber. 4번이 개체별 고유번호인지는 모터를 물려봐야 안다.
+OD_IDENTITY   = 0x1018
+OD_DEVICE_NAME = 0x1008
+OD_DRIVE_MODE = 0x2301   # U16 1:개루프 2:폐루프
+OD_PPR        = 0x2302   # U16 회전당 펄스
+OD_SUP_MODES  = 0x6502   # U32 지원 운전모드 비트
+SW_TARGET_REACHED = 0x0400   # 상태워드 bit10 (CiA402 PP 목표도달)
+
+# 기준값 — Day1(2026-07-08)에 실제로 물려서 읽은 값.
+TEST_REF = {
+    "man":        0xA79,     # ManufacturerID
+    "product":    0x3100,    # ProductCode
+    "drive_mode": 2,         # 폐루프
+    "ppr":        10000,     # 회전당 펄스
+    "sup_modes":  0xA5,      # PP·PV·HM·CSP
+}
+
+# 합격/불합격 임계값.
+# ⚠️ 아래 숫자는 아직 실측 근거가 없는 초기값이다(추측). 정상 모터 2~3대를
+#    먼저 돌려서 실제 측정치를 보고 조정할 것. 같은 폴더의 test_limits.json 을
+#    만들어 두면 코드를 고치지 않고 덮어쓸 수 있다.
+TEST_LIMITS = {
+    "enable_ms_min":    100,    # 운전허가까지 걸린 시간 하한 (Day1 실측 ≈1009ms)
+    "enable_ms_max":    2500,   # 상한
+    "idle_jitter_max":  60,     # 정지 중 위치 흔들림 pulse
+    "err_1rev":         80,     # 1회전 왕복 후 복귀 오차 pulse
+    "err_5rev":         150,    # 5회전 왕복 후
+    "err_sweep":        300,    # 속도 스윕 후
+    "err_stress":       400,    # 급가감속 반복 후
+    "err_final":        500,    # 전체 종료 후 원점 복귀 오차
+    "speed_tol_pct":    12,     # 지령 속도 대비 실측 최고속도 오차 %
+    "ferr_max":         2500,   # 이동 중 최대 추종오차 pulse
+}
+
+# 속도 스윕 항목 (rev/s). 이동량은 그 속도에 실제로 도달하도록 자동 계산한다.
+TEST_SWEEP_SPEEDS = (3.0, 8.0, 15.0)
+TEST_ACCEL_NORMAL = 100000    # 일반 구간 가속 pulse/s^2
+TEST_ACCEL_SWEEP  = 300000    # 스윕: 짧은 거리에서 목표속도 도달용
+TEST_ACCEL_STRESS = 600000    # 급가감속 스트레스
+TEST_RESULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_results")
+TEST_CSV = os.path.join(TEST_RESULT_DIR, "motor_test.csv")
+
+
+def load_test_limits():
+    """test_limits.json 이 있으면 임계값을 덮어쓴다(코드 수정 없이 튜닝)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_limits.json")
+    lim = dict(TEST_LIMITS)
+    try:
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                lim.update(json.load(f))
+    except Exception:
+        pass
+    return lim
 
 
 # =============================================================================
@@ -166,6 +229,37 @@ class EtherCATWorker(threading.Thread):
         except queue.Empty:
             pass
 
+    def _parse_tx(self):
+        """수신한 TxPDO를 status에 반영하고 추종오차를 반환.
+        TxPDO: [statusword U16][actual_pos I32][actual_speed I32]
+               [error_code U16][io_status I32][follow_err I32]  = 20 bytes
+        (_cycle 과 셀프테스트 양쪽에서 쓰므로 함수로 분리)"""
+        data = bytes(self.slave.input)
+        self.status["tx_len"] = len(data)   # 60F4(추종오차) 매핑 여부 판별용
+        ferr = self.status.get("follow_err", 0)
+        if len(data) >= 20:
+            sw, apos, aspd, ec, io, ferr = struct.unpack("<HiiHii", data[:20])
+            self.status["follow_err"] = ferr
+        elif len(data) >= 16:  # 60F4 미매핑 폴백
+            sw, apos, aspd, ec, io = struct.unpack("<HiiHi", data[:16])
+        elif len(data) >= 10:  # 매핑 실패 등 폴백
+            sw, apos, aspd = struct.unpack("<Hii", data[:10])
+            self.status["status_word"] = sw
+            self.status["actual_pos"] = apos
+            self.status["actual_speed"] = aspd
+            return ferr
+        else:
+            return ferr
+        self.status["status_word"] = sw
+        self.status["actual_pos"] = apos
+        self.status["actual_speed"] = aspd
+        self.status["error_code"] = ec
+        self.status["io_status"] = io
+        self.status["limit_neg"] = bool(io & 0x1)   # bit0 역방향 리밋
+        self.status["limit_pos"] = bool(io & 0x2)   # bit1 정방향 리밋
+        self.status["limit_home"] = bool(io & 0x4)  # bit2 홈
+        return ferr
+
     # ---- 한 주기 PDO 교환 ----
     def _cycle(self):
         # 비상정지 처리: 토크 차단 유지, 잔여 목표 제거, 1회 로그
@@ -184,36 +278,7 @@ class EtherCATWorker(threading.Thread):
         else:
             self.status["wkc_ok"] = True
 
-        # TxPDO: [statusword U16][actual_pos I32][actual_speed I32]
-        #        [error_code U16][io_status I32][follow_err I32]  = 20 bytes
-        data = bytes(self.slave.input)
-        ferr = self.status.get("follow_err", 0)
-        if len(data) >= 20:
-            sw, apos, aspd, ec, io, ferr = struct.unpack("<HiiHii", data[:20])
-            self.status["status_word"] = sw
-            self.status["actual_pos"] = apos
-            self.status["actual_speed"] = aspd
-            self.status["error_code"] = ec
-            self.status["io_status"] = io
-            self.status["follow_err"] = ferr
-            self.status["limit_neg"] = bool(io & 0x1)   # bit0 역방향 리밋
-            self.status["limit_pos"] = bool(io & 0x2)   # bit1 정방향 리밋
-            self.status["limit_home"] = bool(io & 0x4)  # bit2 홈
-        elif len(data) >= 16:  # 60F4 미매핑 폴백
-            sw, apos, aspd, ec, io = struct.unpack("<HiiHi", data[:16])
-            self.status["status_word"] = sw
-            self.status["actual_pos"] = apos
-            self.status["actual_speed"] = aspd
-            self.status["error_code"] = ec
-            self.status["io_status"] = io
-            self.status["limit_neg"] = bool(io & 0x1)
-            self.status["limit_pos"] = bool(io & 0x2)
-            self.status["limit_home"] = bool(io & 0x4)
-        elif len(data) >= 10:  # 매핑 실패 등 폴백
-            sw, apos, aspd = struct.unpack("<Hii", data[:10])
-            self.status["status_word"] = sw
-            self.status["actual_pos"] = apos
-            self.status["actual_speed"] = aspd
+        ferr = self._parse_tx()
 
         # 끝단감지: 추종오차가 소프트 임계 초과 → 폴트(토크차단=하중낙하) 전에 Halt(홀딩유지)
         if (self.hardstop_on and not self.hardstop_latched
@@ -294,6 +359,8 @@ class EtherCATWorker(threading.Thread):
             self._read_limit_cfg()
         elif name == "save_params":
             self._save_params()
+        elif name == "selftest":
+            self._run_selftest(cmd[1], cmd[2])
 
     # ---- 연결/구성 ----
     def _connect(self, ifname):
@@ -399,12 +466,15 @@ class EtherCATWorker(threading.Thread):
 
     # ---- 상태 전이 ----
     def _io_once(self):
-        """1주기 PDO 교환 후 상태워드 반환."""
+        """1주기 PDO 교환 후 상태워드 반환.
+        (_parse_tx 로 status 전체를 갱신하므로 셀프테스트처럼 _cycle 이 멈춘
+         구간에서도 화면의 위치·추종오차가 계속 살아 있다)"""
         self.slave.output = struct.pack("<HiI", self.control_word & 0xFFFF,
                                         self.target_pos, self.profile_speed & 0xFFFFFFFF)
         self.master.send_processdata()
         self.master.receive_processdata(2000)
-        return struct.unpack("<H", bytes(self.slave.input)[:2])[0]
+        self._parse_tx()
+        return self.status.get("status_word", 0)
 
     def _pump(self, cycles):
         """제어워드를 반영하며 n주기 PDO를 밀어준다. 비상정지 시 즉시 중단."""
@@ -431,17 +501,20 @@ class EtherCATWorker(threading.Thread):
         self._pump(15)
         self.control_word = 0x000F
         # ENA(bit2) 켜질 때까지 폴링 (이 드라이버는 ~1초 걸림). 최대 3초.
-        for i in range(750):
+        # 경과시간은 벽시계로 잰다(주기 곱셈은 PDO 왕복시간이 빠져 실제보다 짧게 나옴).
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 3.0:
             sw = self._io_once()
-            self.status["status_word"] = sw
             if sw & 0x0004:                      # bit2 Operation Enabled
-                self.log(f"[i] ✅ 운전허가됨 (Operation Enabled, {int(i * self.CYCLE * 1000)}ms)")
-                return
+                ms = int((time.monotonic() - t0) * 1000)
+                self.log(f"[i] ✅ 운전허가됨 (Operation Enabled, {ms}ms)")
+                return ms
             if sw & 0x0008:                      # bit3 Error
                 self.log(f"[!] Enable 중 Error 비트 (0x{sw:04X}) → Fault Reset 필요")
-                return
+                return None
             time.sleep(self.CYCLE)
         self.log(f"[!] 3초 내 운전허가 실패 (마지막 0x{self.status.get('status_word', 0):04X})")
+        return None
 
     # ---- 끝단감지(위치편차) ----
     def _cfg_hardstop(self, on, thr):
@@ -661,6 +734,432 @@ class EtherCATWorker(threading.Thread):
         self.control_word = CW_ENABLE | CW_HALT
         self.log("[i] ■ 연속조그 정지(Halt)")
 
+    # =====================================================================
+    #  신품 입고검사 — "새 모터 테스트"
+    # =====================================================================
+    def _sdo_num(self, index, sub, fmt, size):
+        """SDO 한 항목을 숫자로 읽는다. 실패하면 None (미구현 오브젝트 판별용)."""
+        try:
+            return struct.unpack(fmt, self.slave.sdo_read(index, sub)[:size])[0]
+        except Exception:
+            return None
+
+    def _read_identity(self):
+        """식별정보. 1018h:04 시리얼이 개체마다 다르면 그게 진짜 하드웨어 아이디다.
+        (이 드라이버가 시리얼을 넣어놨는지는 모터를 물려봐야 안다 → 값 그대로 기록)
+        ※ ESC EEPROM(Station Alias)은 건드리지 않는다. EEPROM 워드 7의 체크섬이
+          워드 0~6을 덮으므로, 별도 계산 없이 alias만 쓰면 슬레이브가 인식 안 될
+          수 있다. 신품 42대에 걸 위험이 아니다."""
+        idn = {}
+        try:
+            idn["name"] = self.slave.name
+            idn["man"] = self.slave.man
+            idn["product"] = self.slave.id
+            idn["revision"] = self.slave.rev
+        except Exception:
+            idn.setdefault("name", "?")
+        idn["serial"] = self._sdo_num(OD_IDENTITY, 4, "<I", 4)
+        return idn
+
+    def _t_item(self, res, name, ok, detail, critical=True):
+        """검사 항목 하나를 기록. critical=False 면 불합격이어도 경고로만 본다."""
+        res["items"].append({"name": name, "ok": bool(ok), "detail": detail,
+                             "critical": critical})
+        mark = "✅" if ok else ("❌" if critical else "⚠️")
+        self.log(f"    {mark} {name} — {detail}")
+        self.status["test_items"] = list(res["items"])
+
+    def _wait_stopped(self, limit=2.0):
+        """축이 실제로 멈출 때까지 기다린다.
+        이게 없으면 앞 이동이 아직 감속 중인데 다음 이동을 걸어버려서, 다음
+        이동의 '출발 위치'와 '최고속도'가 전부 엉킨다(2026-08-19 실측으로 확인)."""
+        t0 = time.monotonic()
+        low = 0
+        while time.monotonic() - t0 < limit:
+            self._io_once()
+            if abs(self.status.get("actual_speed", 0)) < 100:
+                low += 1
+                if low >= 15:      # 60ms 연속 정지
+                    return True
+            else:
+                low = 0
+            time.sleep(self.CYCLE)
+        return False
+
+    def _move_timeout(self, delta, v, accel):
+        """사다리꼴 프로파일 예상 소요시간의 3배 + 1초를 타임아웃으로 쓴다."""
+        d = abs(delta)
+        d_ramp = v * v / accel                    # 가속거리 + 감속거리
+        if d > d_ramp:
+            t = 2.0 * v / accel + (d - d_ramp) / v
+        else:
+            t = 2.0 * math.sqrt(d / accel)
+        return max(2.0, t * 3.0 + 1.0)
+
+    def _t_ferr(self, res, name, val, limit):
+        """추종오차 판정. 60F4h가 TxPDO에 안 실렸으면 '측정 못 함'으로 남긴다.
+        (값 0을 합격으로 적으면 측정 안 된 걸 통과로 착각하게 된다)"""
+        if self.status.get("tx_len", 0) < 20:
+            self._t_item(res, name, True,
+                         "60F4h 미매핑 → 측정 못 함(합격 근거 아님)", critical=False)
+        else:
+            self._t_item(res, name, val <= limit, f"{val} pulse (허용 {limit})")
+
+    def _test_move(self, delta, speed_rev, accel):
+        """상대이동 1회 + 완전히 멈출 때까지 대기하며 실측.
+        완료 판정은 '속도가 0이고 목표 근처'를 160ms 연속 만족할 때만 인정한다.
+        속도가 한 번 낮아졌다고 바로 끝내면 감속 중에 위치를 읽어버린다.
+        반환: dict(pos_err, max_ferr, max_speed, fault, aborted, reached_bit, secs)"""
+        # 앞 이동이 완전히 멈춘 뒤에 출발 위치를 읽는다(엉킴 방지의 핵심)
+        self._wait_stopped()
+        start = self.status.get("actual_pos", 0)
+        target = start + delta
+        v = max(200.0, abs(speed_rev) * App.PPR)
+        self.profile_speed = int(v)
+        try:
+            self.slave.sdo_write(OD_ACCEL, 0, struct.pack("<I", int(accel)))
+            self.slave.sdo_write(OD_DECEL, 0, struct.pack("<I", int(accel)))
+        except Exception as e:  # noqa
+            self.log(f"[!] 가감속 설정 실패: {e}")
+        timeout = self._move_timeout(delta, v, accel)
+        tol = max(50, int(abs(delta) * 0.002))    # 도달로 인정할 위치 여유
+
+        self._move(delta, relative=True, immediate=True)
+        t0 = time.monotonic()
+        max_ferr = 0
+        max_spd = 0
+        started = False
+        reached_bit = False
+        low = 0                  # 저속이 몇 주기 연속인지
+        why = "타임아웃"
+        while time.monotonic() - t0 < timeout:
+            if self._estop_ev.is_set():
+                return {"aborted": True, "pos_err": 0, "max_ferr": max_ferr,
+                        "max_speed": max_spd, "fault": 0, "reached_bit": reached_bit,
+                        "secs": 0, "why": "비상정지"}
+            self._io_once()
+            sw = self.status.get("status_word", 0)
+            pos = self.status.get("actual_pos", 0)
+            spd = abs(self.status.get("actual_speed", 0))
+            max_spd = max(max_spd, spd)
+            max_ferr = max(max_ferr, abs(self.status.get("follow_err", 0)))
+            if sw & SW_TARGET_REACHED:
+                reached_bit = True
+            if self.status.get("error_code", 0):
+                why = "폴트"
+                break
+            if spd > 500:
+                started = True
+            low = low + 1 if spd < 100 else 0
+            near = abs(target - pos) <= tol
+            # 드라이버가 목표도달(bit10)을 주면 그게 가장 확실한 근거다.
+            # 안 주는 펌웨어도 있으므로 '정지 100ms 연속 + 목표 근처'를 대안으로 둔다.
+            if started and near and (low >= 25 or (reached_bit and low >= 8)):
+                why = "정상도달"
+                break
+            if started and low >= 100:
+                why = "멈췄으나 목표 못감"   # 0.4초 정지인데 목표와 멀다
+                break
+            if not started and low >= 250:
+                why = "안 움직임"
+                break
+            time.sleep(self.CYCLE)
+        secs = time.monotonic() - t0
+        self._pump(25)          # 100ms 추가 정착
+        end = self.status.get("actual_pos", 0)
+        r = {"aborted": False, "pos_err": end - target, "max_ferr": max_ferr,
+             "max_speed": max_spd, "fault": self.status.get("error_code", 0),
+             "reached_bit": reached_bit, "secs": secs, "why": why}
+        # 이동 하나하나의 실측을 로그에 남긴다(판정이 이상할 때 근거가 됨)
+        self.log(f"      · {delta:+d}p @{speed_rev:g}rev/s → 최고 "
+                 f"{max_spd / App.PPR:.2f}rev/s, {secs:.2f}초, 도달오차 "
+                 f"{r['pos_err']:+d}p, bit10={'Y' if reached_bit else 'N'}, {why}")
+        return r
+
+    def _run_selftest(self, motor_id, note):
+        if not self.op:
+            self.log("[!] OP 아님 - 먼저 ① 연결")
+            return
+        if self.status.get("test_running"):
+            self.log("[!] 이미 검사 중")
+            return
+        lim = load_test_limits()
+        res = {"id": motor_id, "note": note, "items": [], "meas": {}}
+        self.status["test_running"] = True
+        self.status["test_items"] = []
+        self.status["test_verdict"] = ""
+        self.status["test_id"] = motor_id
+        self._estop_ev.clear()
+        t_start = time.monotonic()
+        self.log(f"\n===== 새 모터 테스트 시작  [{motor_id}] =====")
+        try:
+            self._selftest_body(res, lim)
+        except Exception as e:  # noqa
+            self._t_item(res, "검사 중 예외", False, str(e))
+        finally:
+            # 어떤 경우에도 토크 차단하고 끝낸다(모터 교체 안전)
+            self.control_word = 0x0000
+            try:
+                self._pump(10)
+            except Exception:
+                pass
+            res["meas"]["elapsed_s"] = round(time.monotonic() - t_start, 1)
+            self._finish_selftest(res)
+            self.status["test_running"] = False
+            self.status["test_step"] = ""
+
+    def _selftest_body(self, res, lim):
+        PPR = App.PPR
+        M = res["meas"]
+        N = 9
+
+        def step(i, title):
+            if self._estop_ev.is_set():
+                raise RuntimeError("비상정지로 중단됨")
+            self.status["test_step"] = f"{i}/{N} {title}"
+            self.log(f"[{i}/{N}] {title}")
+
+        # ---- 1. 통신·식별 -------------------------------------------------
+        step(1, "통신·식별")
+        idn = self._read_identity()
+        M.update(idn)
+        man, prod, rev = idn.get("man"), idn.get("product"), idn.get("revision")
+        self._t_item(res, "제조사ID", man == TEST_REF["man"],
+                     f"{'0x%X' % man if man is not None else '읽기실패'} "
+                     f"(기준 0x{TEST_REF['man']:X})")
+        self._t_item(res, "제품코드", prod == TEST_REF["product"],
+                     f"{'0x%X' % prod if prod is not None else '읽기실패'} "
+                     f"(기준 0x{TEST_REF['product']:X})", critical=False)
+        self._t_item(res, "리비전", rev is not None,
+                     f"{'0x%X' % rev if rev is not None else '읽기실패'}", critical=False)
+        self._io_once()                      # TxPDO 길이 확인용 1주기
+        txl = self.status.get("tx_len", 0)
+        M["tx_len"] = txl
+        self._t_item(res, "TxPDO 길이", txl >= 20,
+                     f"{txl}바이트 — "
+                     + ("60F4h(추종오차)까지 실림" if txl >= 20
+                        else "60F4h 안 실림 → 추종오차·끝단감지 측정 불가"),
+                     critical=False)
+        ser = idn.get("serial")
+        self._t_item(res, "하드웨어 시리얼(1018h:04)", True,
+                     f"{ser}" if ser else "없음/미구현 → 아이디는 사람이 붙인 번호로만 관리",
+                     critical=False)
+
+        # ---- 2. 공장 파라미터 ---------------------------------------------
+        step(2, "공장 파라미터")
+        dm = self._sdo_num(OD_DRIVE_MODE, 0, "<H", 2)
+        ppr = self._sdo_num(OD_PPR, 0, "<H", 2)
+        peak = self._sdo_num(OD_PEAK_CURRENT, 0, "<H", 2)
+        sup = self._sdo_num(OD_SUP_MODES, 0, "<I", 4)
+        M.update({"drive_mode": dm, "ppr": ppr, "peak_ma": peak, "sup_modes": sup})
+        self._t_item(res, "운전모드 2301h", dm == TEST_REF["drive_mode"],
+                     f"{dm} (기준 {TEST_REF['drive_mode']}=폐루프)")
+        self._t_item(res, "회전당 펄스 2302h", ppr == TEST_REF["ppr"],
+                     f"{ppr} (기준 {TEST_REF['ppr']})")
+        self._t_item(res, "피크전류 2303h", peak is not None, f"{peak} mA", critical=False)
+        self._t_item(res, "지원모드 6502h", sup == TEST_REF["sup_modes"],
+                     f"{'0x%X' % sup if sup is not None else '읽기실패'} "
+                     f"(기준 0x{TEST_REF['sup_modes']:X})", critical=False)
+
+        # ---- 3. 운전허가 시간 ---------------------------------------------
+        # 폐루프 정렬에 걸리는 시간. 너무 길거나 짧으면 엔코더/정렬 이상 신호.
+        step(3, "운전허가(Enable) 시간")
+        ms = self._enable()
+        M["enable_ms"] = ms
+        self._t_item(res, "운전허가 시간",
+                     ms is not None and lim["enable_ms_min"] <= ms <= lim["enable_ms_max"],
+                     f"{ms}ms (허용 {lim['enable_ms_min']}~{lim['enable_ms_max']})"
+                     if ms is not None else "운전허가 실패")
+        if ms is None:
+            raise RuntimeError("운전허가가 안 되어 이후 검사를 못 함")
+
+        # ---- 4. 정지 안정성 -----------------------------------------------
+        # 명령 없이 서 있을 때 위치가 흔들리면 엔코더나 정류에 문제가 있다.
+        step(4, "정지 안정성")
+        lo = hi = self.status.get("actual_pos", 0)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 0.6:
+            self._io_once()
+            p = self.status.get("actual_pos", 0)
+            lo = min(lo, p); hi = max(hi, p)
+            time.sleep(self.CYCLE)
+        jit = hi - lo
+        M["idle_jitter"] = jit
+        self._t_item(res, "정지 중 흔들림", jit <= lim["idle_jitter_max"],
+                     f"{jit} pulse (허용 {lim['idle_jitter_max']})")
+
+        origin = self.status.get("actual_pos", 0)
+        M["origin"] = origin
+
+        # ---- 5. 저속 1회전 왕복 -------------------------------------------
+        step(5, "저속 1회전 정·역")
+        a = self._test_move(+PPR, 1.0, TEST_ACCEL_NORMAL)
+        b = self._test_move(-PPR, 1.0, TEST_ACCEL_NORMAL)
+        if a["aborted"] or b["aborted"]:
+            raise RuntimeError("비상정지로 중단됨")
+        err1 = abs(self.status.get("actual_pos", 0) - origin)
+        f1 = max(a["max_ferr"], b["max_ferr"])
+        M.update({"err_1rev": err1, "ferr_1rev": f1,
+                  "bit10_seen": bool(a["reached_bit"] or b["reached_bit"])})
+        self._t_item(res, "1회전 왕복 복귀오차", err1 <= lim["err_1rev"],
+                     f"{err1} pulse (허용 {lim['err_1rev']})")
+        self._t_ferr(res, "1회전 최대 추종오차", f1, lim["ferr_max"])
+        self._chk_fault(res, "1회전 구간 폴트")
+
+        # ---- 6. 다회전 ----------------------------------------------------
+        step(6, "5회전 정·역")
+        a = self._test_move(+5 * PPR, 5.0, TEST_ACCEL_NORMAL)
+        b = self._test_move(-5 * PPR, 5.0, TEST_ACCEL_NORMAL)
+        if a["aborted"] or b["aborted"]:
+            raise RuntimeError("비상정지로 중단됨")
+        err5 = abs(self.status.get("actual_pos", 0) - origin)
+        f5 = max(a["max_ferr"], b["max_ferr"])
+        M.update({"err_5rev": err5, "ferr_5rev": f5})
+        self._t_item(res, "5회전 왕복 복귀오차", err5 <= lim["err_5rev"],
+                     f"{err5} pulse (허용 {lim['err_5rev']})")
+        self._t_ferr(res, "5회전 최대 추종오차", f5, lim["ferr_max"])
+        self._chk_fault(res, "5회전 구간 폴트")
+
+        # ---- 7. 속도 스윕 --------------------------------------------------
+        # 이동량을 속도에 비례시켜, 가감속 구간만으로 끝나지 않고 지령속도에
+        # 실제로 도달하게 한다(짧은 이동이면 최고속도에 못 닿아 측정이 무의미).
+        step(7, "속도 스윕")
+        sweep = []
+        for v in TEST_SWEEP_SPEEDS:
+            revs = max(2.0, v * 0.9)
+            fw = self._test_move(int(+revs * PPR), v, TEST_ACCEL_SWEEP)
+            bw = self._test_move(int(-revs * PPR), v, TEST_ACCEL_SWEEP)
+            if fw["aborted"] or bw["aborted"]:
+                raise RuntimeError("비상정지로 중단됨")
+            want = v * PPR
+            got = max(fw["max_speed"], bw["max_speed"])
+            dev = abs(got - want) / want * 100.0
+            ferr = max(fw["max_ferr"], bw["max_ferr"])
+            sweep.append((v, got, dev, ferr))
+            self._t_item(res, f"{v:g} rev/s 속도", dev <= lim["speed_tol_pct"],
+                         f"실측 {got / PPR:.2f} rev/s (오차 {dev:.1f}%, "
+                         f"허용 {lim['speed_tol_pct']}%)")
+            self._t_ferr(res, f"{v:g} rev/s 추종오차", ferr, lim["ferr_max"])
+        M["sweep"] = "; ".join(f"{v:g}rev/s→{g / PPR:.2f}({d:.0f}%,fe{f})"
+                               for v, g, d, f in sweep)
+        errs = abs(self.status.get("actual_pos", 0) - origin)
+        M["err_sweep"] = errs
+        self._t_item(res, "스윕 후 복귀오차", errs <= lim["err_sweep"],
+                     f"{errs} pulse (허용 {lim['err_sweep']})")
+        self._chk_fault(res, "스윕 구간 폴트")
+
+        # ---- 8. 급가감속 반복 ----------------------------------------------
+        # Day1에 폭주가 났던 조건(고가속 출발)을 일부러 재현해 탈조를 잡는다.
+        step(8, "급가감속 반복(4회 왕복)")
+        fmax = 0
+        for _ in range(4):
+            a = self._test_move(+2 * PPR, 10.0, TEST_ACCEL_STRESS)
+            b = self._test_move(-2 * PPR, 10.0, TEST_ACCEL_STRESS)
+            if a["aborted"] or b["aborted"]:
+                raise RuntimeError("비상정지로 중단됨")
+            fmax = max(fmax, a["max_ferr"], b["max_ferr"])
+            if self.status.get("error_code", 0):
+                break
+        errst = abs(self.status.get("actual_pos", 0) - origin)
+        M.update({"err_stress": errst, "ferr_stress": fmax})
+        self._t_item(res, "급가감속 후 복귀오차", errst <= lim["err_stress"],
+                     f"{errst} pulse (허용 {lim['err_stress']})")
+        self._t_ferr(res, "급가감속 최대 추종오차", fmax, lim["ferr_max"])
+        self._chk_fault(res, "급가감속 구간 폴트")
+
+        # ---- 9. 원점 복귀 + 마무리 -----------------------------------------
+        step(9, "원점 복귀·마무리")
+        back = origin - self.status.get("actual_pos", 0)
+        if abs(back) > 5:
+            self._test_move(back, 3.0, TEST_ACCEL_NORMAL)
+        errf = abs(self.status.get("actual_pos", 0) - origin)
+        M["err_final"] = errf
+        self._t_item(res, "최종 원점 복귀오차", errf <= lim["err_final"],
+                     f"{errf} pulse (허용 {lim['err_final']}) "
+                     f"= {errf / PPR * 360:.2f}도")
+        self._chk_fault(res, "최종 폴트")
+        self._t_item(res, "목표도달 비트(6041 bit10)", True,
+                     "관측됨" if M.get("bit10_seen") else "관측 안 됨(정지판정은 속도로 함)",
+                     critical=False)
+
+    def _chk_fault(self, res, label):
+        ec = self.status.get("error_code", 0)
+        self._t_item(res, label, ec == 0,
+                     "없음" if ec == 0 else
+                     f"0x{ec:04X} {ERROR_TEXT.get(ec, '알수없음')}")
+        if ec:
+            # 다음 구간을 위해 폴트 해제 시도
+            self._fault_reset()
+            self._enable()
+
+    def _finish_selftest(self, res):
+        """판정 → 로그 → CSV 한 줄 추가."""
+        hard = [it for it in res["items"] if it["critical"] and not it["ok"]]
+        warn = [it for it in res["items"] if not it["critical"] and not it["ok"]]
+        verdict = "합격" if not hard else "불합격"
+        res["verdict"] = verdict
+        res["fail_names"] = ", ".join(it["name"] for it in hard)
+        res["warn_names"] = ", ".join(it["name"] for it in warn)
+        self.status["test_verdict"] = verdict
+        self.status["test_fail_names"] = res["fail_names"]
+        self.status["test_warn_names"] = res["warn_names"]
+        mark = "✅ 합격" if verdict == "합격" else "❌ 불합격"
+        self.log(f"===== [{res['id']}] {mark}  "
+                 f"({res['meas'].get('elapsed_s')}초) =====")
+        if hard:
+            self.log(f"    불합격 항목: {res['fail_names']}")
+        if warn:
+            self.log(f"    경고 항목: {res['warn_names']}")
+        self.log("    → 운전 OFF 상태. 랜선/전원 분리하고 다음 모터를 물리세요\n")
+        try:
+            self._write_csv(res)
+            self.status["test_csv"] = TEST_CSV
+        except Exception as e:  # noqa
+            self.log(f"[ERR] 결과 CSV 저장 실패: {e}")
+
+    CSV_COLS = ["시각", "아이디", "판정", "불합격항목", "경고항목",
+                "시리얼", "제조사ID", "제품코드", "리비전", "장치명",
+                "운전모드", "회전당펄스", "피크전류mA", "지원모드",
+                "운전허가ms", "정지흔들림", "err_1rev", "ferr_1rev",
+                "err_5rev", "ferr_5rev", "속도스윕", "err_sweep",
+                "err_stress", "ferr_stress", "err_final", "TxPDO길이", "bit10",
+                "소요초", "메모"]
+
+    def _write_csv(self, res):
+        os.makedirs(TEST_RESULT_DIR, exist_ok=True)
+        M = res["meas"]
+
+        def hexs(v):
+            return f"0x{v:X}" if isinstance(v, int) else ""
+
+        row = {
+            "시각": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "아이디": res["id"], "판정": res["verdict"],
+            "불합격항목": res["fail_names"], "경고항목": res["warn_names"],
+            "시리얼": M.get("serial", ""), "제조사ID": hexs(M.get("man")),
+            "제품코드": hexs(M.get("product")), "리비전": hexs(M.get("revision")),
+            "장치명": M.get("name", ""), "운전모드": M.get("drive_mode", ""),
+            "회전당펄스": M.get("ppr", ""), "피크전류mA": M.get("peak_ma", ""),
+            "지원모드": hexs(M.get("sup_modes")), "운전허가ms": M.get("enable_ms", ""),
+            "정지흔들림": M.get("idle_jitter", ""),
+            "err_1rev": M.get("err_1rev", ""), "ferr_1rev": M.get("ferr_1rev", ""),
+            "err_5rev": M.get("err_5rev", ""), "ferr_5rev": M.get("ferr_5rev", ""),
+            "속도스윕": M.get("sweep", ""), "err_sweep": M.get("err_sweep", ""),
+            "err_stress": M.get("err_stress", ""), "ferr_stress": M.get("ferr_stress", ""),
+            "err_final": M.get("err_final", ""),
+            "TxPDO길이": M.get("tx_len", ""),
+            "bit10": "Y" if M.get("bit10_seen") else "N",
+            "소요초": M.get("elapsed_s", ""),
+            "메모": res.get("note", ""),
+        }
+        new = not os.path.exists(TEST_CSV)
+        with open(TEST_CSV, "a", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=self.CSV_COLS)
+            if new:
+                w.writeheader()
+            w.writerow(row)
+        self.log(f"    💾 결과 저장: {TEST_CSV}")
+
     def _read_al_status(self):
         try:
             self.log(f"    AL status code = {hex(self.slave.al_status)}")
@@ -698,7 +1197,7 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("TL-E EtherCAT 모터 제어")
-        root.geometry("940x720")
+        root.geometry("1000x900")
         root.minsize(720, 460)
 
         self.log_q = queue.Queue()
@@ -708,9 +1207,15 @@ class App:
                        "hold_pct": 0, "hold_ma": 0, "io_status": 0,
                        "limit_pos": False, "limit_neg": False, "limit_home": False,
                        "di_raw": 0, "error_sdo": 0, "pos_dev": 0,
-                       "follow_err": 0, "hardstop_hit": False}
+                       "follow_err": 0, "hardstop_hit": False,
+                       # 새 모터 테스트
+                       "test_running": False, "test_step": "", "test_items": [],
+                       "test_verdict": "", "test_fail_names": "",
+                       "test_warn_names": "", "test_id": "", "test_csv": ""}
         self.worker = None
         self._was_fault = False
+        self._test_was_running = False
+        self._test_items_n = -1        # 항목 수가 늘 때만 다시 그린다
         self._loading = False                          # 리밋 UI 동기화 중 콜백 억제
         self.v_speed_rev = tk.DoubleVar(value=1.0)     # rev/s
         self.v_step = tk.DoubleVar(value=5.0)          # deg
@@ -729,6 +1234,16 @@ class App:
         self.v_decel = tk.StringVar(value="보통")       # 감속 프리셋 키
         self.v_hardstop_on = tk.BooleanVar(value=False)  # 끝단감지(위치편차) 사용
         self.v_hardstop_thr = tk.StringVar(value="3000") # 끝단감지 임계 pulse
+        # --- 새 모터 테스트: 아이디 ---
+        # 이 드라이버가 개체 시리얼을 갖고 있는지는 물려봐야 안다(1018h:04).
+        # 그래서 아이디의 기준은 사람이 붙이는 번호로 두고, 하드웨어 시리얼은
+        # 읽히면 같이 기록한다. 로트 + 일련번호 → 예: L2608-001
+        self.v_lot = tk.StringVar(value=datetime.date.today().strftime("L%y%m"))
+        self.v_seq = tk.StringVar(value="1")
+        self.v_total = tk.StringVar(value="42")
+        self.v_autoinc = tk.BooleanVar(value=True)
+        self.v_note = tk.StringVar(value="")
+        self._test_last_id = ""
 
         st = ttk.Style()
         st.configure("Big.TButton", font=("Helvetica", 14, "bold"), padding=10)
@@ -777,7 +1292,9 @@ class App:
         main.add(left, weight=0)
         main.add(right, weight=1)
         # 초기 경계 위치(드래그로 변경 가능)
-        self.root.after(120, lambda: main.sashpos(0, 540))
+        self.root.after(120, lambda: main.sashpos(0, 560))
+        # 패널이 길어져서 시작하자마자 아래로 밀려 보이는 일이 있어 맨 위로 맞춘다
+        self.root.after(200, lambda: canvas.yview_moveto(0))
 
         # ===== ① 연결 =====
         f1 = ttk.LabelFrame(body, text=" ① 연결 ")
@@ -790,6 +1307,58 @@ class App:
         self.btn_conn = ttk.Button(row, text="연결", command=self.on_connect)
         self.btn_conn.pack(side="left", padx=2)
         ttk.Button(row, text="해제", command=self.on_disconnect).pack(side="left", padx=2)
+
+        # ===== ⓪ 새 모터 테스트 (신품 입고검사) =====
+        ft = ttk.LabelFrame(body, text=" 🧪 새 모터 테스트 (신품 입고검사) ")
+        ft.pack(fill="x", pady=4)
+
+        # 아이디: 로트 + 일련번호. 하드웨어 시리얼은 검사 중에 읽어서 같이 기록한다.
+        ti = ttk.Frame(ft); ti.pack(fill="x", padx=8, pady=(8, 2))
+        ttk.Label(ti, text="로트").pack(side="left")
+        ttk.Entry(ti, textvariable=self.v_lot, width=7).pack(side="left", padx=(3, 8))
+        ttk.Label(ti, text="번호").pack(side="left")
+        ttk.Entry(ti, textvariable=self.v_seq, width=5).pack(side="left", padx=3)
+        ttk.Label(ti, text="/").pack(side="left")
+        ttk.Entry(ti, textvariable=self.v_total, width=4).pack(side="left", padx=3)
+        ttk.Checkbutton(ti, text="자동증가", variable=self.v_autoinc).pack(side="left", padx=6)
+
+        ti2 = ttk.Frame(ft); ti2.pack(fill="x", padx=8, pady=2)
+        ttk.Label(ti2, text="아이디").pack(side="left")
+        self.lbl_testid = tk.Label(ti2, text="-", font=("Menlo", 13, "bold"), fg="#111827")
+        self.lbl_testid.pack(side="left", padx=6)
+        ttk.Label(ti2, text="메모").pack(side="left", padx=(10, 2))
+        ttk.Entry(ti2, textvariable=self.v_note, width=16).pack(side="left", padx=2)
+        for v in (self.v_lot, self.v_seq):
+            v.trace_add("write", lambda *a: self._sync_testid())
+
+        self.btn_test = tk.Button(ft, text="🧪 새 모터 테스트 시작",
+                                  bg="#2563eb", fg="white", activebackground="#1d4ed8",
+                                  activeforeground="white",
+                                  font=("Helvetica", 15, "bold"), relief="raised", bd=3,
+                                  command=self.on_selftest)
+        self.btn_test.pack(fill="x", padx=8, pady=(6, 2))
+
+        self.lbl_tprog = ttk.Label(ft, text="대기 중 — 연결 후 시작을 누르세요",
+                                   font=("Helvetica", 11))
+        self.lbl_tprog.pack(anchor="w", padx=10, pady=(0, 2))
+
+        self.lbl_tverdict = tk.Label(ft, text="판정 —", bg="#e5e7eb", fg="#111827",
+                                     font=("Helvetica", 16, "bold"), height=2)
+        self.lbl_tverdict.pack(fill="x", padx=8, pady=2)
+
+        self.txt_titems = tk.Text(ft, height=9, font=("Menlo", 10), wrap="none")
+        self.txt_titems.pack(fill="x", padx=8, pady=2)
+
+        tb = ttk.Frame(ft); tb.pack(fill="x", padx=8, pady=(0, 8))
+        self.lbl_tcount = ttk.Label(tb, text="합격 0 · 불합격 0 · 남음 42")
+        self.lbl_tcount.pack(side="left")
+        ttk.Button(tb, text="결과 CSV 열기",
+                   command=self.on_open_csv).pack(side="right", padx=2)
+        ttk.Button(tb, text="폴더 열기",
+                   command=self.on_open_dir).pack(side="right", padx=2)
+
+        self._sync_testid()
+        self._refresh_test_count()
 
         # ===== ② 준비 =====
         f2 = ttk.LabelFrame(body, text=" ② 준비 ")
@@ -1046,6 +1615,78 @@ class App:
             self._log("[!] 끝단감지 임계 숫자 오류"); return
         self._post("hardstop", self.v_hardstop_on.get(), thr)
 
+    # ---- 새 모터 테스트 콜백 ----
+    def _test_id(self):
+        """아이디 = 로트 + 3자리 일련번호. 예: L2608-001"""
+        lot = self.v_lot.get().strip() or "L"
+        try:
+            n = int(float(self.v_seq.get()))
+        except Exception:
+            n = 0
+        return f"{lot}-{n:03d}"
+
+    def _sync_testid(self, *_):
+        self.lbl_testid.config(text=self._test_id())
+
+    def on_selftest(self):
+        if self.worker is None:
+            self._log("[!] 먼저 ① 연결하세요"); return
+        if self.status.get("test_running"):
+            self._log("[!] 이미 검사 중입니다"); return
+        mid = self._test_id()
+        self._test_items_n = -1
+        self.txt_titems.delete("1.0", "end")
+        self.lbl_tverdict.config(text="검사 중…", bg="#f59e0b", fg="white")
+        self.btn_test.config(state="disabled", text="검사 중…")
+        self._post("selftest", mid, self.v_note.get().strip())
+
+    def _render_test_items(self, items):
+        if len(items) == self._test_items_n:
+            return
+        self._test_items_n = len(items)
+        self.txt_titems.delete("1.0", "end")
+        for it in items:
+            mark = "OK  " if it["ok"] else ("FAIL" if it["critical"] else "warn")
+            self.txt_titems.insert("end", f"{mark}  {it['name']}: {it['detail']}\n")
+        self.txt_titems.see("end")
+
+    def _refresh_test_count(self):
+        """CSV를 읽어 합격/불합격/남은 수량 표시."""
+        ok = ng = 0
+        try:
+            if os.path.exists(TEST_CSV):
+                with open(TEST_CSV, encoding="utf-8-sig") as f:
+                    for r in csv.DictReader(f):
+                        if r.get("판정") == "합격":
+                            ok += 1
+                        elif r.get("판정") == "불합격":
+                            ng += 1
+        except Exception:
+            pass
+        try:
+            total = int(float(self.v_total.get()))
+        except Exception:
+            total = 0
+        self.lbl_tcount.config(text=f"합격 {ok} · 불합격 {ng} · "
+                                    f"남음 {max(0, total - ok - ng)}")
+
+    def _open_path(self, path):
+        """맥에서 파일/폴더 열기. sudo로 돌고 있으면 원래 사용자 권한으로 연다."""
+        if not os.path.exists(path):
+            self._log(f"[!] 아직 없습니다: {path}"); return
+        user = os.environ.get("SUDO_USER")
+        cmd = ["sudo", "-u", user, "open", path] if user else ["open", path]
+        try:
+            subprocess.Popen(cmd)
+        except Exception as e:  # noqa
+            self._log(f"[!] 열기 실패: {e}  → 직접 여세요: {path}")
+
+    def on_open_csv(self):
+        self._open_path(TEST_CSV)
+
+    def on_open_dir(self):
+        self._open_path(TEST_RESULT_DIR)
+
     # ---- 리미트 스위치 콜백 ----
     def _apply_limit(self, side):
         """체크박스/DI/NC 변경 시 해당 방향 리밋 설정을 워커에 전달."""
@@ -1137,6 +1778,33 @@ class App:
         if self.status.get("pos_dev_sync"):
             self.status["pos_dev_sync"] = False
             self.v_posdev.set(str(self.status.get("pos_dev", 4000)))
+
+        # ---- 새 모터 테스트 표시 ----
+        running = bool(s.get("test_running"))
+        self._render_test_items(s.get("test_items", []))
+        if running:
+            self.lbl_tprog.config(text=f"진행 중 — {s.get('test_step', '')}")
+        if self._test_was_running and not running:
+            # 검사 1대가 막 끝난 순간: 판정 표시 + 번호 자동증가 + 수량 갱신
+            v = s.get("test_verdict", "")
+            if v == "합격":
+                self.lbl_tverdict.config(text=f"✅ 합격  [{s.get('test_id', '')}]",
+                                         bg="#16a34a", fg="white")
+            elif v == "불합격":
+                self.lbl_tverdict.config(
+                    text=f"❌ 불합격  [{s.get('test_id', '')}]\n{s.get('test_fail_names', '')}",
+                    bg="#dc2626", fg="white")
+            else:
+                self.lbl_tverdict.config(text="중단됨", bg="#6b7280", fg="white")
+            self.lbl_tprog.config(text="끝. 랜선/전원 분리하고 다음 모터를 물리세요")
+            self.btn_test.config(state="normal", text="🧪 새 모터 테스트 시작")
+            if self.v_autoinc.get():
+                try:
+                    self.v_seq.set(str(int(float(self.v_seq.get())) + 1))
+                except Exception:
+                    pass
+            self._refresh_test_count()
+        self._test_was_running = running
 
         # 리밋 LED: 빨강=신호감지(트리거) / 초록=사용중(정상) / 회색=미사용
         self.led_pos.config(fg="#dc2626" if s.get("limit_pos")

@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 report/_*.png
+test_results/
+test_limits.json
